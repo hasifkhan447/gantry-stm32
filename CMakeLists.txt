@@ -46,6 +46,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/Src/host_io.c
     App/Src/protocol.c
+    App/Src/motor.c
     App/Src/app_init.c
 )
 
