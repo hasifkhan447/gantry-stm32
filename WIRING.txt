@@ -1,0 +1,101 @@
+================================================================================
+GANTRY CLI — PIN / WIRING MAP
+Target board: STM32F3DISCOVERY  (STM32F303VCT6)
+Transport:    USB CDC (Virtual COM Port) on USB_USER connector (PA11/PA12)
+Power:        Same USB_USER cable (single-cable host link)
+================================================================================
+
+MOTORS (Yaskawa Sigma-5 in pulse+sign position mode)
+--------------------------------------------------------------------------------
+Logical          STM32 pin   CubeMX role              Notes
+--------------------------------------------------------------------------------
+X_A_STEP         PB6         TIM4_CH1 (PWM Gen)       Left X-gantry motor
+X_A_DIR          PA9         GPIO_Output              SIGN input to driver
+X_A_SON          PA10        GPIO_Output              /S-ON enable (active low)
+
+X_B_STEP         PB7         TIM4_CH2 (PWM Gen)       Right X-gantry motor
+X_B_DIR          PA8         GPIO_Output
+X_B_SON          PA15        GPIO_Output              PA15 = JTDI, free under SWD
+
+X_A and X_B SHARE TIM4 counter -> guaranteed step-lockstep for the dual-drive
+gantry. Both motors get identical pulse trains; mechanical squaring done at
+homing.
+
+Y_STEP           PA6         TIM3_CH1 (PWM Gen)       Independent feedrate
+Y_DIR            PB10        GPIO_Output
+Y_SON            PB11        GPIO_Output
+
+Z_STEP           PA5         TIM2_CH1 (PWM Gen)       Independent feedrate
+Z_DIR            PB12        GPIO_Output
+Z_SON            PB13        GPIO_Output
+
+YAW              (not connected yet — reserve TIM15_CH1 on PA2 or PB14)
+
+SERIAL TRANSPORT
+--------------------------------------------------------------------------------
+USB peripheral   USB_OTG_FS Device mode, Communication Device Class (CDC)
+USB D-           PA11        (reserved by USB, do not reassign)
+USB D+           PA12        (reserved by USB, do not reassign)
+Connector        USB_USER (mini-USB) on STM32F3DISCOVERY
+Host visibility  /dev/ttyACM0 on Linux, COMxx on Windows
+Baud             irrelevant on CDC (USB framing) — pyserial settings ignored
+Power            Bus-powered from the same USB cable
+
+DRIVER ALARM INPUTS  (reserved, not wired yet)
+--------------------------------------------------------------------------------
+X_A_ALM          PE0         GPIO_Input + pull-up     Sigma-5 /ALM (open-collector)
+X_B_ALM          PE1         GPIO_Input + pull-up
+Y_ALM            PE2         GPIO_Input + pull-up
+Z_ALM            PE4         GPIO_Input + pull-up     skip PE3 (gyro CS pull-up)
+
+SAFETY / IO  (deferred — to be wired in a later pass)
+--------------------------------------------------------------------------------
+ESTOP_IN         PC13        GPIO_EXTI13, falling, PU External e-stop button
+X1_LIM           PA1         GPIO_Input + pull-up     X- end limit
+X2_LIM           PA2         GPIO_Input + pull-up     X+ end limit
+Y1_LIM           PA3         GPIO_Input + pull-up     Y- end limit
+Y2_LIM           PA4         GPIO_Input + pull-up     Y+ end limit
+SOLENOID         PB0         GPIO_Output              Pick/place actuator
+                                                       (drive through transistor)
+
+OFF-LIMITS / RESERVED
+--------------------------------------------------------------------------------
+PA13, PA14       SWDIO / SWCLK                        debugger
+PF0, PF1         OSC_IN / OSC_OUT                     HSE crystal traces
+PA0              Has external 10k pull-down (user button); avoid for inputs
+PE8 – PE15       On-board LEDs (can repurpose if needed)
+
+SACRIFICED ON-BOARD PERIPHERALS
+--------------------------------------------------------------------------------
+L3GD20 gyro      uses PA5/PA6/PA7/PE3 — we now drive PA5/PA6, gyro unusable
+LSM303 acc/mag   uses PB6/PB7 (I2C1)  — we now drive PB6/PB7, accel unusable
+                 NOTE: external 10k pull-ups on PB6/PB7 are harmless for our
+                 push-pull PWM outputs.
+
+PHYSICAL WIRING TO SIGMA-5 (per axis)
+--------------------------------------------------------------------------------
+STM32 *_STEP  -> 3.3->5V level shift -> CN1 PULS+/PULS-   (pulse, ~1us min width)
+STM32 *_DIR   -> 3.3->5V level shift -> CN1 SIGN+/SIGN-   (direction)
+STM32 *_SON   -> open-drain or NPN   -> CN1 /S-ON         (servo enable, active low)
+STM32 *_ALM   <-                     <- CN1 /ALM          (active low, OC)
+GND common between STM32 logic ground and Sigma-5 input common.
+
+Set Sigma-5 parameter Pn200.0 = 1  (pulse + sign input format)
+
+CLOCK CONFIGURATION
+--------------------------------------------------------------------------------
+SYSCLK source    HSE BYPASS @ 8 MHz (from on-board ST-LINK MCO) -> PLL x6
+PLL              ON, source = HSE, mul = 6
+SYSCLK           48 MHz
+HCLK             48 MHz       (AHB prescaler /1)
+APB1             24 MHz       (APB1 prescaler /2; timer clock = 48 MHz)
+APB2             48 MHz       (APB2 prescaler /1; timer clock = 48 MHz)
+USB clock        48 MHz       (PLL/1)
+Flash latency    1 WS
+
+NOTE: HSE_BYPASS uses the ST-LINK's MCO pin as the clock source.
+If the board hangs at boot, the MCO is not being output by the ST-LINK
+firmware. Workaround: switch to HSI/2 -> PLL x12 -> 48 MHz in CubeMX
+(disable HSE entirely).
+
+================================================================================
