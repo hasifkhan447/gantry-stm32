@@ -49,6 +49,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/Src/motor.c
     App/Src/axes.c
     App/Src/app_init.c
+    App/Src/solenoid.c
 )
 
 # Add include paths

@@ -1,0 +1,573 @@
+================================================================================
+RACKING_FIXES.txt   --   Yaskawa Sigma-5 (SGDV) tuning guide for this gantry
+================================================================================
+
+Context:
+  X axis is dual-drive (X_A + X_B, both 400 W SGMJV/SGMAV) on a shared gantry
+  rail. Y is single 200 W. Z is single 400 W. All in pulse+sign mode. Frame
+  is mechanically compliant -- racking shows up as one X side leading the
+  other under hard acceleration. Almost every fix below is about (a) making
+  the two X drives respond IDENTICALLY, and (b) smoothing the command so the
+  frame is not shock-loaded.
+
+This file is organized:
+  0.  TL;DR
+  1.  Hardware / connection prep (USB + SigmaWin+ on Linux)
+  2.  The parameter groups that matter and what each does
+  3.  Per-motor specifics (400 W X_A/X_B/Z vs 200 W Y)
+  4.  Initial "safe / soft" parameter set to flash on every drive
+  5.  Autotuning, step by step (Fn201 / Fn202 / Fn203)
+  6.  Dual-X (X_A and X_B) -- making them behave as one
+  7.  Notch filters and frame-resonance suppression
+  8.  Copying a config between drives  (SigmaWin+, manual, and Pn00C tricks)
+  9.  Saving parameters and verifying
+ 10.  Re-tune trigger list (when to redo all this)
+
+
+================================================================================
+0.  TL;DR -- if you only do five things
+================================================================================
+
+1.  Measure or estimate the load-to-motor inertia ratio per axis and set Pn103
+    on each drive. Wrong Pn103 is the single biggest source of mismatched
+    response between X_A and X_B.
+
+2.  Detune until the frame stops ringing, then come back up. Start with:
+        Pn100 = 200    (20.0 Hz speed loop gain)
+        Pn101 = 3300   (33.00 ms integral)
+        Pn102 = 200    (20.0 1/s position loop gain)
+    These are softer than factory and will not rack your frame.
+
+3.  Apply the host-command smoothing in the drive:
+        Pn216 = 50     (5.0 ms exponential filter)
+        Pn217 = 100    (10.0 ms moving-average filter)  <-- this is the S-curve
+    Both X drives must have IDENTICAL values here.
+
+4.  Mirror X_A -> X_B with SigmaWin+ "Parameter Copy" (over USB, in Wine).
+    Manual transcription works but takes ~30 minutes per drive and is
+    error-prone for the values that matter (Pn103, Pn216, Pn217).
+
+5.  Save with Fn007 if you used the panel, or "Write to Drive + Save" in
+    SigmaWin+. Power-cycle and verify.
+
+
+================================================================================
+1.  Hardware / connection prep
+================================================================================
+
+1.1  USB cable
+     The Sigma-5 has a mini-B USB connector on the front panel, behind the
+     small door above the operator. This is the SigmaWin+ port. You do NOT
+     need CN3 / RS-422 for tuning. Each drive has its own USB connector;
+     you tune one at a time.
+
+1.2  Linux setup -- there is no native Linux tuning software
+     Yaskawa ships SigmaWin+ for Windows only. Options:
+
+       (a) SigmaWin+ in Wine (recommended, free)
+           - Install Wine >= 8 (your distro's package).
+           - Download SigmaWin+ Ver.7 from Yaskawa's site (free, account
+             required).
+           - Run the installer under Wine.
+           - Pass the USB device through: ensure your user is in the
+             "dialout" group, then start SigmaWin+. The drive shows up
+             as a serial-class USB device; Wine maps it to COMx.
+           - You may need 'usbutils' and a udev rule giving your user
+             access to vid/pid 0x05ad/0x0001 (or whichever the Sigma-5
+             enumerates as -- check `lsusb` after plugging in).
+           Known limitations under Wine: the real-time trace scope works
+           but lags. Most parameter editing, monitoring, and Parameter
+           Copy work fine.
+
+       (b) Windows VM (VirtualBox / QEMU with USB passthrough)
+           Most reliable, but heavyweight. Use this if Wine misbehaves on
+           your distro.
+
+       (c) Panel operator only
+           The 5-button panel on the drive itself can read/write every
+           parameter. Slow, but completely sufficient for tuning -- it's
+           what existed before SigmaWin+. See Section 8 for the manual
+           workflow.
+
+       (d) Custom serial tooling
+           The USB port speaks a documented serial protocol (Yaskawa's
+           "DRIVER" command set). There is no widely maintained open-source
+           Linux library, and writing one is more work than running
+           SigmaWin+ in Wine. Skip.
+
+1.3  Power and enable state
+     Tuning operations like Fn201 will spin the motor. The drive must be
+     enabled (drive shows "run", not "bb" or "Pot"). With the /S-ON override
+     already in place (Pn50A.1 = 7), it will spin as soon as you trigger
+     the autotune from SigmaWin+ or the panel.
+
+1.4  Disconnect dual-X temporarily for solo tuning
+     For initial autotune of X_A and X_B individually, mechanically
+     decouple one from the gantry (or be ready to E-stop if they fight).
+     Fn201 commands ~3 revolutions of motion; if both motors are coupled
+     and only one is moving, the rail will twist. The cleanest workflow is
+     to autotune Y, Z, and one X (say X_A) standalone, then mirror to X_B
+     without re-running autotune on it.
+
+
+================================================================================
+2.  The parameter groups that matter
+================================================================================
+
+Sigma-5 has hundreds of parameters. These are the ones that drive stability.
+All values shown are typical / factory defaults unless noted.
+
+  -- Servo loop gains -----------------------------------------------------
+
+  Pn100  Speed Loop Gain               (0.1 Hz)         default 400 (= 40.0 Hz)
+         Higher = stiffer / faster response, more prone to ring.
+         Most powerful single knob for "the motor feels twitchy / soft".
+
+  Pn101  Speed Loop Integral Time      (0.01 ms)        default 2000 (= 20.0 ms)
+         Shorter = more aggressive integral action. If too short with a
+         compliant frame, you get hunting / limit-cycle oscillation.
+
+  Pn102  Position Loop Gain            (0.1 /s)         default 400 (= 40.0 /s)
+         Higher = tighter following, more overshoot.
+
+  Pn103  Moment of Inertia Ratio       (%)              default 0
+         Load_inertia / Motor_inertia * 100. CRITICAL. The drive uses
+         this to scale its internal gain calculations. If actual load is
+         5x motor and you leave Pn103=0, the loop is effectively running
+         at 1/5 the intended gain -- and X_A vs X_B can differ a lot if
+         their loads aren't identical (mirror mounting, cable mass, etc.).
+
+  Pn109  Torque Feed-Forward           (%)              default 0
+         Adds command derivative as a torque feed-forward. Improves
+         following but causes overshoot/oscillation if Pn103 is wrong or
+         the two X drives have mismatched Pn109. Leave at 0 until basic
+         tuning is solid.
+
+  Pn10A  Feed-Forward Filter Time      (0.01 ms)        default 0
+
+  Pn140  Model Following Control
+         .0  enable (0 = disabled, 1 = enabled)         default 0 (Sigma-5)
+         .1  vibration suppression in MFC mode
+         Advanced; only useful once you have a clean autotune.
+
+  -- Command-input filters (the racking-killers) --------------------------
+
+  Pn216  Position Reference Accel/Decel Filter (0.1 ms) default 0
+         First-order exponential LPF on the incoming pulse train. Tames
+         step changes in commanded rate (e.g. between trapezoid segments).
+         Set the SAME value on X_A and X_B or you induce racking yourself.
+
+  Pn217  Avg Movement Time of Position Reference (0.1 ms) default 0
+         Moving-average filter. Turns a trapezoidal velocity command
+         into a true S-curve at the drive end. Effective range 0 - 1000
+         (= 0 - 100 ms). 50-200 (5-20 ms) is a typical comfortable range
+         for compliant frames.
+
+         Choose ONE of Pn216 / Pn217 as the "main" smoother, or use both
+         lightly. Pn217 is the better choice for racking suppression
+         because it gives a smooth derivative profile.
+
+  Pn200  Reference Pulse Form          (digit)         default 0x0000
+         .0 = pulse format (0 = sign+pulse, neg logic).
+         You set this already; leave alone unless you change cable wiring.
+
+  -- Torque / current loop ------------------------------------------------
+
+  Pn401  1st Torque Reference Filter Time (0.01 ms)    default 100 (1.00 ms)
+         LPF on the commanded torque. Bump up (say 200-400) if the motor
+         whines or you see audible high-frequency oscillation.
+
+  Pn402  Forward Torque Limit          (%)             default 800 (800%)
+  Pn403  Reverse Torque Limit          (%)             default 800
+         Cap the peak torque to limit racking forces during fault
+         conditions. For initial bringup, 300% is conservative.
+
+  -- Notch filters --------------------------------------------------------
+
+  Pn408  Torque-Related Function Switch (bitfield)
+         .0  1st notch enable (0/1)
+         .1  2nd notch enable (0/1)
+         .2  friction compensation enable
+         .3  anti-vibration enable
+
+  Pn409  1st Notch Filter Frequency    (Hz)            default 5000 (disabled)
+  Pn40A  1st Notch Filter Q                            default 70 (= 0.70)
+  Pn40B  1st Notch Filter Depth                        default 0
+  Pn40C  2nd Notch Filter Frequency
+  Pn40D  2nd Notch Filter Q
+  Pn40E  2nd Notch Filter Depth
+
+         Use these AFTER you know the frame resonance. See Section 7.
+
+  -- Electronic gear (must be identical on X_A and X_B) -------------------
+
+  Pn20E  Electronic Gear Ratio Numerator               default 4
+  Pn210  Electronic Gear Ratio Denominator             default 1
+         Pulses_per_encoder_count = Pn210 / Pn20E. Identical on the two
+         X drives or every pulse on the wire moves them by different
+         amounts.
+
+  -- I/O allocations you've already set -----------------------------------
+
+  Pn50A.1  /S-ON allocation. Set to 7 (always asserted).
+  Pn50A.3  P-OT allocation. Set to 8 (disabled).
+  Pn50B.0  N-OT allocation. Set to 8 (disabled).
+
+
+================================================================================
+3.  Per-motor specifics (400 W vs 200 W)
+================================================================================
+
+Good news: the drive auto-detects the motor model from the encoder, so
+you do NOT need to set motor type, rated speed, rated torque, or pole
+count manually. The drive scales internal computations based on the
+detected motor.
+
+What IS different between the 200 W (Y) and the 400 W (X_A, X_B, Z):
+
+  - Motor rotor inertia. The 200 W rotor is smaller, so for the same
+    physical load the inertia ratio Pn103 will be larger on Y than on X
+    or Z. Example: if all four motors push 0.5 kg-cm^2 of load:
+        400 W SGMJV-04ADA (J_motor ~ 0.246 kg-cm^2):  Pn103 = 203
+        200 W SGMJV-02ADA (J_motor ~ 0.135 kg-cm^2):  Pn103 = 370
+    Real numbers will depend on your motor part number; check the
+    Sigma-5 motor datasheet (or page 1 of SigmaWin+ which displays it).
+
+  - Safe maximum gain. Smaller motors can take slightly higher Pn100
+    (Hz) because the torque/inertia ratio at the rotor is higher. In
+    practice the gantry's compliance dominates, so all four end up at
+    similar gains.
+
+  - Torque saturation. 400 W rated torque ~ 1.27 Nm continuous, 3.82 Nm
+    peak. 200 W ~ 0.637 Nm continuous, 1.91 Nm peak. If you set the
+    same Pn402 (%) on both, the 400 W will physically twist the frame
+    harder during a fault.
+
+  - Same factory defaults. The DEFAULT Pn100, Pn101, Pn102 values are
+    motor-independent. Differences only emerge after autotune.
+
+Implication: tune each axis from scratch on its own. Do NOT copy Y's
+parameter set to X.
+
+
+================================================================================
+4.  Initial "safe / soft" set -- write this to every drive first
+================================================================================
+
+This gives you a starting point that will NOT rack the frame and that is
+stable enough to run autotune from. Each value is given as drive units
+(what you punch into the operator panel) and the human-readable
+interpretation.
+
+  Pn100 = 200       speed loop gain        = 20.0 Hz       (default 400)
+  Pn101 = 3300      speed integral         = 33.00 ms      (default 2000)
+  Pn102 = 200       position loop gain     = 20.0 /s       (default 400)
+  Pn103 = (see Sec 3, per-axis, or autotune sets it)
+  Pn109 = 0         feed-forward off
+  Pn216 = 50        accel filter           = 5.0 ms
+  Pn217 = 100       averaging              = 10.0 ms
+  Pn401 = 200       torque filter          = 2.0 ms        (default 100)
+  Pn402 = 300       forward torque limit   = 300%          (default 800)
+  Pn403 = 300       reverse torque limit   = 300%          (default 800)
+  Pn408 = 0x0000    no notches yet
+  Pn170.0 = 0       disable tuning-less (we'll tune manually)
+                    -- if you want a fallback, leave Pn170.0 = 1 with
+                       Pn170.2 = 3 (low rigidity)
+
+X_A and X_B get IDENTICAL values for all of the above. Y is per-axis.
+Z is per-axis.
+
+After punching these in, power-cycle, confirm "run" on each drive, and
+do a slow MOVE (e.g. 5000 steps at 5 kHz) on each axis from the host to
+verify nothing is mis-wired. Then move to autotune.
+
+
+================================================================================
+5.  Autotuning, step by step
+================================================================================
+
+Three relevant utility functions on the drive:
+
+  Fn201  Advanced Autotuning
+         Drive moves the motor through a built-in test pattern (~3 rev
+         each direction) and computes Pn100, Pn101, Pn102, Pn103, plus
+         the notch filters. Best general-purpose tune.
+
+  Fn202  Advanced Autotuning by Reference
+         Same idea but uses YOUR commands. Use when the axis cannot
+         freely move +/- 3 rev (e.g. limited travel).
+
+  Fn203  One-Parameter Tuning
+         You move the rigidity knob (1..10 or 1..31 depending on firmware)
+         and the drive updates everything proportionally. Good for fine
+         adjustment after Fn201.
+
+5.1  Procedure with SigmaWin+ in Wine (preferred)
+
+     a.  Plug USB into the drive being tuned. Launch SigmaWin+.
+     b.  File -> Open -> select the drive. Wait for connection.
+     c.  Tools -> Tuning -> Advanced Autotuning.
+     d.  Select "Standard mode" (Fn201). Mode setting page:
+           - Movement range: +/- 3 revs (or what your axis allows)
+           - Tuning target: "Position control" (you're in pulse+sign)
+           - Load level: "Soft" for first pass
+     e.  Hit Start. The motor will move. Do not E-stop unless something
+         is clearly wrong (loud noise, runaway, smoke).
+     f.  After completion, SigmaWin+ shows you the proposed values and
+         lets you Write to Drive. Accept.
+     g.  Run a "Tuneless / Trial Operation" move (also in Tools -> Tuning)
+         to verify stability. The trace scope will show position error;
+         it should converge to ~0 within a few ms.
+     h.  If you see ringing on the trace: Tools -> Tuning -> One-Parameter
+         Tuning, lower rigidity by 1-2 steps, Write.
+     i.  File -> Save Parameters to Drive (or Fn007 from the panel) --
+         this commits to non-volatile memory.
+
+5.2  Procedure from the front-panel operator (no PC)
+
+     The panel has the same Fn201 mode. Sequence (Sigma-5 manual section
+     5.6.2):
+     a.  Power up. Drive should show "run" (or "bb" if /S-ON is not
+         asserted yet -- fix that first).
+     b.  Press MODE/SET until you reach Function mode (display shows
+         "FnXXX").
+     c.  Up/Down to "Fn201". Press DATA.
+     d.  Set tuning conditions per the manual (movement range, mode).
+         Use UP/DOWN + DATA to navigate fields.
+     e.  Hold the START key (-> arrow). Drive will execute the autotune
+         sequence. Hold the key the WHOLE time (this is a safety
+         interlock). Release = abort.
+     f.  When complete, the panel shows "donE". Press DATA to apply,
+         then Fn007 to save to EEPROM.
+
+5.3  When autotune fails or you cannot give it +/- 3 rev
+     Use Fn202: send your normal commands from the host and the drive
+     analyzes them. Requires the load to actually move during the
+     analysis, so command a reciprocating motion (the existing TUI's
+     "r<axis> N" cycle is exactly right -- 5-10 cycles is enough).
+
+5.4  Caveat for compliant frames
+     Autotune assumes a rigid coupling. With your gantry's flex, autotune
+     will tend to set gains a bit higher than is comfortable. After
+     accepting the autotune result, MANUALLY drop:
+         Pn100 by ~30%
+         Pn102 by ~30%
+     and increase Pn401 by 50%. Then re-run a movement test.
+
+
+================================================================================
+6.  Dual-X -- making X_A and X_B behave as one
+================================================================================
+
+This is where racking comes from. Three rules:
+
+R1.  The following parameters MUST be byte-identical between the two
+     drives:
+
+         Pn20E, Pn210   electronic gear
+         Pn100, Pn101, Pn102, Pn103   servo loop gains
+         Pn109, Pn10A   feed-forward and FF filter
+         Pn216, Pn217   command filters
+         Pn401          torque filter
+         Pn402, Pn403   torque limits
+         Pn408 - Pn40E  notch filters
+         Pn200          reference pulse form
+         Pn140          model following control
+
+R2.  Pn103 (inertia ratio) reflects the load that drive is moving. With
+     a symmetrically mounted gantry both sides see the same load -- but
+     mirror mounting, cable mass, drag chain, etc. can introduce a
+     small asymmetry. If after copying parameters you still see racking
+     under hard acceleration, tweak Pn103 on the lagging drive by
+     +/- 20% and retest.
+
+R3.  Tune ONLY X_A (or only X_B). Copy the result to the other. Do NOT
+     run autotune on both independently -- the autotune algorithm will
+     converge to slightly different values each time because of
+     mechanical and electrical noise, and "slightly different" is
+     exactly what racks the frame.
+
+Workflow:
+  i.    Mechanically decouple X_B from the gantry (or remove its motor
+        coupler) so X_A can move freely.
+  ii.   Run Fn201 on X_A as in Section 5.
+  iii.  Detune by ~30% as in 5.4.
+  iv.   Copy X_A's parameters to X_B (Section 8).
+  v.    Re-couple X_B.
+  vi.   Test with low speed first. Send `fx` from the TUI, then `rx 5`
+        to do cycles. Increase rate gradually.
+  vii.  If racking appears at high speed, BUMP Pn217 on BOTH drives by
+        +50 (5 ms) and retest. Repeat until smooth.
+
+
+================================================================================
+7.  Notch filters and frame-resonance suppression
+================================================================================
+
+Compliant frames usually have one or two dominant resonances in the
+20-500 Hz range. If autotune sets the speed loop gain near that
+frequency, the loop excites the resonance and you get oscillation.
+
+Two approaches, in increasing effort:
+
+7.1  Stay below it (easy)
+     Lower Pn100 until the ringing stops. You'll lose stiffness but the
+     frame is the limit anyway. This is what Section 4's "soft" set does.
+
+7.2  Notch it out (better)
+     Use SigmaWin+'s "FFT Analysis" or "Mechanical Analysis" tool. It
+     commands a chirp and shows you the Bode plot. Identify the
+     resonance peak; set:
+
+         Pn409 = (resonance frequency in Hz)
+         Pn40A = 70    (Q = 0.7, gentle)
+         Pn40B = 0     (full depth)
+         Pn408.0 = 1   (enable 1st notch)
+
+     If there's a second peak, repeat with Pn40C / Pn40D / Pn40E and
+     Pn408.1 = 1. Both X drives get the same notch settings.
+
+     The Sigma-5's autotune in "Soft" mode will also auto-place notch
+     filters; check Pn408 after autotune and see what it picked.
+
+7.3  Anti-vibration (sometimes worth trying)
+     Fn205 (Vibration Suppression Setting) adds a model-based
+     anti-vibration term for low-frequency frame oscillation (1-50 Hz).
+     Useful for a long, springy gantry. Same caveat: identical settings
+     on X_A and X_B.
+
+
+================================================================================
+8.  Copying configuration between drives
+================================================================================
+
+Three methods, fastest to slowest.
+
+8.1  SigmaWin+ "Parameter Copy" (recommended)
+
+     a.  Connect to source drive (X_A). File -> Parameter -> Read from
+         Drive. Save the .par file (e.g. xa_tuned.par).
+     b.  Disconnect, connect to target drive (X_B).
+     c.  File -> Parameter -> Open File -> xa_tuned.par.
+     d.  Parameter -> Write to Drive. Accept the diff preview.
+     e.  Tools -> Save Parameters (or Fn007 from panel) to commit.
+     f.  Power-cycle X_B.
+
+     This copies EVERY Pn parameter, which is usually what you want for
+     X_A/X_B but is overkill for X -> Y or Z. For partial copies, edit
+     the .par file by hand (it's text) before writing.
+
+8.2  Manual transcription with a checklist
+
+     If you cannot get SigmaWin+ running, write down the values for the
+     parameters listed in Section 6 R1 from the source drive, then enter
+     them on the target. Use the panel:
+
+         MODE/SET to "PnXXX" parameter mode
+         UP/DOWN to scroll to the parameter
+         DATA to enter the value, UP/DOWN to change digits,
+             DATA again to confirm
+         Move to the next, repeat
+         Fn007 to save
+
+     Allow 30 minutes per drive. Cross-check by reading each value back
+     after writing -- you will mis-transcribe at least once.
+
+8.3  Pn00C "Function Selection -- Application Switch C" (not a copy!)
+     Common confusion: Pn00C is not a parameter-copy function. There is
+     no panel-only "drive A -> drive B" copy. You either use SigmaWin+
+     or transcribe manually.
+
+
+================================================================================
+9.  Saving, verifying, and rolling back
+================================================================================
+
+  Save           Fn007 on panel, or SigmaWin+ "Write to Drive + Save".
+                 Most Pn changes take effect on the next power cycle
+                 (parameters marked "After restart" in the manual).
+                 Pn216/Pn217 are runtime-effective; Pn50A/Pn50B require
+                 restart.
+
+  Verify         Power-cycle. Drive shows "run". Run the TUI:
+                     python3 host/gantry_tui.py --profile scurve
+                 Try low speed first (sx 20000, dx 2), then ramp up to
+                 the demo speed (sx 200000 or higher). Watch the gantry
+                 -- any visible twist between X sides = racking, drop
+                 back and add more Pn217.
+
+  Roll back      Fn005 = "parameter initialization" resets ALL Pn to
+                 factory. Use only if you've completely lost the plot.
+                 ALWAYS save a Parameter file from SigmaWin+ before
+                 doing any experimental tuning.
+
+  Diff           SigmaWin+ has "Compare Parameters" between a file and
+                 the drive. Use this to confirm X_A and X_B are
+                 byte-identical after copy.
+
+
+================================================================================
+10. When to redo all this
+================================================================================
+
+Trigger                                       What to redo
+---------------------------------------------------------------------------
+Add or remove mass from the X carriage         Pn103, then notch check
+Change drag chain / cable routing on X         Pn103 sanity check
+Swap an X motor or drive                       Full Section 6 mirror
+Loosen / re-tension a belt                     Re-run Fn201
+Swap encoder cable                             Nothing (auto-detected)
+Move the gantry to a different table/floor     Re-check resonances (7.2)
+Change Pn216/Pn217 on one X drive              Immediately mirror to the
+                                               other -- mismatched filters
+                                               cause racking by themselves
+
+
+================================================================================
+Appendix A.  Quick-reference card to tape to the controller
+================================================================================
+
+  X racking when accelerating hard?
+      1. Pn217 += 50 on BOTH X drives.
+      2. Re-test. Still racking? Pn100 *= 0.7 on BOTH.
+      3. Confirm Pn103 matches between A and B (within 10%).
+
+  X "hunts" / hums at rest?
+      1. Pn101 += 1000 (longer integral).
+      2. Pn100 *= 0.9.
+
+  Audible whine during motion?
+      1. Pn401 += 100 (more torque filter).
+      2. If unchanged, look for resonance: SigmaWin+ FFT, add notch.
+
+  X overshoots its target?
+      1. Pn102 *= 0.8.
+      2. Pn109 = 0 if it's nonzero.
+
+  X and Y move "fine alone" but trip when combined?
+      Power-supply sag. Check 24 V bus under load; the demo PSU may
+      not source full peak current for two simultaneous accels.
+
+  Drive shows "A.51" or "A.7A"?
+      Overspeed or overcurrent during autotune. Drop rigidity by 2
+      levels and re-run, or reduce movement range.
+
+
+================================================================================
+Appendix B.  Settings deliberately NOT touched
+================================================================================
+
+  Pn001  Application Function 1   -- factory default is correct for our use
+  Pn002  Application Function 2
+  Pn00B  Application Function B   -- contains display mode bits, leave alone
+  Pn20A  Number of External Encoder Scale Pitch -- we don't have one
+  Pn304  JOG Speed                -- only relevant for Fn002 jog mode
+  Pn50C-Pn513  Other I/O signal allocations -- you'll touch these later
+                when wiring proper /S-ON and /ALM-RST through level shifters
+  Pn600, Pn603  Regen resistor    -- only if you add an external regen
+                                     resistor; not needed at our duty cycle
+
+
+================================================================================
+End of RACKING_FIXES.txt
+================================================================================

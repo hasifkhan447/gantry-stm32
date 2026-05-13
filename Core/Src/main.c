@@ -94,19 +94,7 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  __HAL_TIM_SET_AUTORELOAD(&htim4, 7999);
-  TIM4->CCR1 = TIM4->ARR/2; // PERMASET 1/2 duty cycle
-  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
-
-  // EN
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, GPIO_PIN_RESET); //Set both to 0?
-
-  // DIR
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_RESET);
-
-
-
-
+  /* Motor timers and SON/DIR pins are owned by axes.c — no boot-time setup here. */
   /* USER CODE END 2 */
 
   /* Init scheduler */

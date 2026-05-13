@@ -8,6 +8,7 @@
 #include "axes.h"
 #include "host_io.h"
 #include "protocol.h"
+#include "solenoid.h"
 
 #define PROTOCOL_STACK_WORDS  512
 
@@ -38,6 +39,7 @@ static void debug_leds_init(void)
 void app_init(void)
 {
     debug_leds_init();
+    solenoid_init();
     host_io_init();
     osThreadId_t id = osThreadNew(protocol_task, NULL, &protocol_task_attr);
     if (id == NULL) {

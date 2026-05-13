@@ -10,11 +10,11 @@
 
 #include "axes.h"
 #include "host_io.h"
-#include "motor.h"
+#include "solenoid.h"
 
 #define LINE_MAX        128
 #define DEFAULT_HZ      10000U
-#define MAX_HZ          200000U
+#define MAX_HZ          500000U
 
 static char *skip_ws(char *p)
 {
@@ -31,11 +31,10 @@ static bool tok_is(const char *line, const char *kw, uint16_t kwlen)
 static void handle_move(char *args)
 {
     char *p = skip_ws(args);
+    if (*p == '\0')            { host_write("ERR usage MOVE <axis> <steps> [F <hz>]\r\n"); return; }
 
-    char axis_letter = *p;
-    if (axis_letter == '\0') { host_write("ERR usage MOVE <axis> <steps> [F <hz>]\r\n"); return; }
-    Motor *m = axes_get(axis_letter);
-    if (m == NULL)             { host_write("ERR unknown axis\r\n"); return; }
+    AxisId id = axes_id_from_letter(*p);
+    if (id == AXIS_COUNT)      { host_write("ERR unknown axis\r\n"); return; }
     p++;
     p = skip_ws(p);
 
@@ -54,32 +53,45 @@ static void handle_move(char *args)
     }
 
     if (steps_signed == 0)     { host_write("ERR zero steps\r\n"); return; }
-    if (motor_is_moving(m))    { host_write("ERR busy\r\n"); return; }
 
-    bool positive = (steps_signed > 0);
-    uint32_t abs_steps = positive ? (uint32_t)steps_signed
-                                   : (uint32_t)(-steps_signed);
-    motor_set_dir(m, positive);
-    if (!motor_move(m, abs_steps, hz)) {
-        host_write("ERR move failed\r\n");
+    if (!axes_submit(id, steps_signed, hz)) {
+        host_write("ERR queue full\r\n");
         return;
     }
     host_write("ACK\r\n");
+}
+
+static void handle_vac(char *args)
+{
+    char *p = skip_ws(args);
+    if (*p == '\0') {
+        host_write(solenoid_get() ? "VAC ON\r\n" : "VAC OFF\r\n");
+        return;
+    }
+    if (tok_is(p, "ON", 2) || tok_is(p, "on", 2)) {
+        solenoid_set(true);
+    } else if (tok_is(p, "OFF", 3) || tok_is(p, "off", 3)) {
+        solenoid_set(false);
+    } else if (tok_is(p, "TOGGLE", 6) || tok_is(p, "toggle", 6)
+            || tok_is(p, "T", 1)      || tok_is(p, "t", 1)) {
+        solenoid_toggle();
+    } else {
+        host_write("ERR usage VAC [ON|OFF|TOGGLE]\r\n");
+        return;
+    }
+    host_write(solenoid_get() ? "VAC ON\r\n" : "VAC OFF\r\n");
 }
 
 static void handle_stat(char *args)
 {
     (void)args;
     char buf[48];
-    const char axes[] = "Y";   /* extend to "XYZ" as we wire them */
     char *w = buf;
-    for (uint8_t i = 0; axes[i] != '\0'; ++i) {
-        Motor *m = axes_get(axes[i]);
-        if (m == NULL) continue;
+    for (AxisId id = 0; id < AXIS_COUNT; ++id) {
         if (w != buf) *w++ = ' ';
-        *w++ = axes[i];
+        *w++ = axes_letter(id)[0];
         *w++ = ':';
-        const char *st = motor_is_moving(m) ? "busy" : "idle";
+        const char *st = axes_is_busy(id) ? "busy" : "idle";
         while (*st) *w++ = *st++;
     }
     *w++ = '\r';
@@ -104,6 +116,8 @@ static void handle_line(char *line, uint16_t len)
         handle_move(line + 4);
     } else if (tok_is(line, "STAT", 4)) {
         handle_stat(line + 4);
+    } else if (tok_is(line, "VAC", 3)) {
+        handle_vac(line + 3);
     } else {
         host_write("ERR unknown\r\n");
     }

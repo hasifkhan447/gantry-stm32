@@ -1,5 +1,8 @@
 #include "motor.h"
 
+#include "FreeRTOS.h"
+#include "task.h"
+
 #define MOTOR_MAX        4
 #define TIMER_CLK_HZ     48000000U
 #define TIMER_TICK_HZ    1000000U          /* 1 us tick -> ARR is in microseconds */
@@ -24,6 +27,7 @@ void motor_init(Motor *m,
     m->dir_invert = false;
     m->steps_remaining = 0;
     m->moving = false;
+    m->notify_task = NULL;
 
     motor_disable(m);
     motor_set_dir(m, true);
@@ -55,28 +59,35 @@ bool motor_is_moving(const Motor *m)
     return m->moving;
 }
 
+void motor_set_notify_task(Motor *m, void *task_handle)
+{
+    m->notify_task = task_handle;
+}
+
+/* Compute ARR for a given step frequency, clamped to 16-bit so TIM3/TIM4 work.
+ * Returns (ARR+1); caller uses arr = result-1 and CCR = result/2 for 50% duty. */
+static uint32_t arr_plus_1_for_hz(uint32_t hz)
+{
+    uint32_t v = TIMER_TICK_HZ / hz;
+    if (v < 2U)      v = 2U;
+    if (v > 0xFFFFU) v = 0xFFFFU;
+    return v;
+}
+
 bool motor_move(Motor *m, uint32_t steps, uint32_t hz)
 {
     if (m == NULL || m->moving || steps == 0 || hz == 0) {
         return false;
     }
 
-    /* With a 1 us tick, ARR = (1e6 / hz) - 1.  Clamp to 16-bit range so this
-     * works on TIM3 (16-bit) as well as TIM2 (32-bit). Minimum frequency at
-     * PSC=47 / 16-bit ARR is ~16 Hz, maximum is 1 MHz. */
-    uint32_t arr_plus_1 = TIMER_TICK_HZ / hz;
-    if (arr_plus_1 < 2U)       arr_plus_1 = 2U;
-    if (arr_plus_1 > 0xFFFFU)  arr_plus_1 = 0xFFFFU;
-    uint32_t arr = arr_plus_1 - 1U;
+    uint32_t arr_plus_1 = arr_plus_1_for_hz(hz);
 
     __HAL_TIM_DISABLE(m->htim);
     __HAL_TIM_SET_PRESCALER(m->htim, TIMER_PRESCALER);
-    __HAL_TIM_SET_AUTORELOAD(m->htim, arr);
+    __HAL_TIM_SET_AUTORELOAD(m->htim, arr_plus_1 - 1U);
     __HAL_TIM_SET_COMPARE(m->htim, m->channel, arr_plus_1 / 2U);
     __HAL_TIM_SET_COUNTER(m->htim, 0);
 
-    /* Force PSC/ARR shadow registers to load now, then clear the spurious
-     * update flag the EGR write generated. */
     m->htim->Instance->EGR = TIM_EGR_UG;
     __HAL_TIM_CLEAR_FLAG(m->htim, TIM_FLAG_UPDATE);
 
@@ -88,8 +99,38 @@ bool motor_move(Motor *m, uint32_t steps, uint32_t hz)
     return true;
 }
 
+bool motor_move_pair(Motor *a, Motor *b, uint32_t steps, uint32_t hz)
+{
+    if (a == NULL || b == NULL || a->htim != b->htim) return false;
+    if (a->moving || b->moving || steps == 0 || hz == 0) return false;
+
+    uint32_t arr_plus_1 = arr_plus_1_for_hz(hz);
+
+    __HAL_TIM_DISABLE(a->htim);
+    __HAL_TIM_SET_PRESCALER(a->htim, TIMER_PRESCALER);
+    __HAL_TIM_SET_AUTORELOAD(a->htim, arr_plus_1 - 1U);
+    __HAL_TIM_SET_COMPARE(a->htim, a->channel, arr_plus_1 / 2U);
+    __HAL_TIM_SET_COMPARE(a->htim, b->channel, arr_plus_1 / 2U);
+    __HAL_TIM_SET_COUNTER(a->htim, 0);
+
+    a->htim->Instance->EGR = TIM_EGR_UG;
+    __HAL_TIM_CLEAR_FLAG(a->htim, TIM_FLAG_UPDATE);
+
+    a->steps_remaining = steps;
+    b->steps_remaining = steps;
+    a->moving = true;
+    b->moving = true;
+
+    __HAL_TIM_ENABLE_IT(a->htim, TIM_IT_UPDATE);
+    HAL_TIM_PWM_Start(a->htim, a->channel);
+    HAL_TIM_PWM_Start(a->htim, b->channel);
+    return true;
+}
+
 void motor_irq_dispatch(TIM_HandleTypeDef *htim)
 {
+    BaseType_t higher_woken = pdFALSE;
+
     for (uint8_t i = 0; i < s_motor_count; ++i) {
         Motor *m = s_motors[i];
         if (m->htim != htim || !m->moving) {
@@ -102,6 +143,12 @@ void motor_irq_dispatch(TIM_HandleTypeDef *htim)
             HAL_TIM_PWM_Stop(m->htim, m->channel);
             __HAL_TIM_DISABLE_IT(m->htim, TIM_IT_UPDATE);
             m->moving = false;
+            if (m->notify_task != NULL) {
+                vTaskNotifyGiveFromISR((TaskHandle_t)m->notify_task,
+                                       &higher_woken);
+            }
         }
     }
+
+    portYIELD_FROM_ISR(higher_woken);
 }
