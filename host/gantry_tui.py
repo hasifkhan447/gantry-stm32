@@ -40,11 +40,11 @@ import serial  # pip install pyserial
 
 VALID_AXES = ("X", "Y", "Z")
 MIN_HZ = 2000
-N_ACCEL = 20
-N_DECEL = 20
-N_CRUISE = 8
-ACCEL_FRAC = 0.2
-DECEL_FRAC = 0.2
+N_ACCEL = 5
+N_DECEL = 5
+N_CRUISE = 5
+ACCEL_FRAC = 0.1
+DECEL_FRAC = 0.1
 
 HZ_STEP = 5000
 DURATION_STEP = 0.1
@@ -378,10 +378,10 @@ def tui_loop(stdscr, controller: Controller) -> None:
             return
 
         # jog
-        elif ch in (ord('w'), ord('W')): controller.jog("Y", +1)
-        elif ch in (ord('s'), ord('S')): controller.jog("Y", -1)
-        elif ch in (ord('a'), ord('A')): controller.jog("X", -1)
-        elif ch in (ord('d'), ord('D')): controller.jog("X", +1)
+        elif ch in (ord('w'), ord('W')): controller.jog("X", +1)
+        elif ch in (ord('s'), ord('S')): controller.jog("X", -1)
+        elif ch in (ord('a'), ord('A')): controller.jog("Y", +1)
+        elif ch in (ord('d'), ord('D')): controller.jog("Y", -1)
         elif ch in (ord('k'), ord('K')): controller.jog("Z", +1)
         elif ch in (ord('j'), ord('J')): controller.jog("Z", -1)
 
